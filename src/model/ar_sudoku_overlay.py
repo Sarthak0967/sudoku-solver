@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import random
 
 # ---------- Helper Functions ----------
 
@@ -16,16 +15,33 @@ def reorder(points):
     new[3] = points[np.argmax(diff)]   # bottom-left
     return new
 
-def draw_numbers(img, size):
+
+def extract_matrix(warped, size):
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     cell = size // 9
+
+    matrix = [[0]*9 for _ in range(9)]
+
     for i in range(9):
         for j in range(9):
-            num = random.randint(1, 9)
-            x = j * cell + cell // 3
-            y = i * cell + 2 * cell // 3
-            cv2.putText(img, str(num), (x, y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.9, (0, 0, 255), 2)
+            x, y = j * cell, i * cell
+            cell_img = gray[y:y+cell, x:x+cell]
+
+            cell_img = cv2.resize(cell_img, (28, 28))
+            _, thresh = cv2.threshold(
+                cell_img, 0, 255,
+                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+            )
+
+            # Ignore borders
+            margin = 4
+            roi = thresh[margin:-margin, margin:-margin]
+
+            if cv2.countNonZero(roi) > 50:
+                matrix[i][j] = 1  # digit present
+
+    return matrix
+
 
 # ---------- Main ----------
 
@@ -50,9 +66,7 @@ while True:
 
     # ----- Hough Line Detection -----
     lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180,
+        edges, 1, np.pi / 180,
         threshold=150,
         minLineLength=150,
         maxLineGap=20
@@ -70,7 +84,6 @@ while True:
 
     sudoku_detected = len(h_lines) >= 8 and len(v_lines) >= 8
 
-    # ----- Find Outer Grid -----
     if sudoku_detected:
         contours, _ = cv2.findContours(
             thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -79,14 +92,11 @@ while True:
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
         sudoku_cnt = None
-
         for cnt in contours:
             if cv2.contourArea(cnt) < 5000:
                 continue
-
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
             if len(approx) == 4:
                 sudoku_cnt = approx
                 break
@@ -102,35 +112,21 @@ while True:
                 [0, size]
             ], dtype=np.float32)
 
-            matrix = cv2.getPerspectiveTransform(pts, dst)
-            warped = cv2.warpPerspective(original, matrix, (size, size))
+            matrix_p = cv2.getPerspectiveTransform(pts, dst)
+            warped = cv2.warpPerspective(original, matrix_p, (size, size))
 
-            # ----- Overlay Grid -----
-            cell = size // 9
-            for i in range(1, 9):
-                cv2.line(warped, (0, i * cell), (size, i * cell), (255, 0, 0), 1)
-                cv2.line(warped, (i * cell, 0), (i * cell, size), (255, 0, 0), 1)
+            sudoku_matrix = extract_matrix(warped, size)
 
-            # ----- Overlay Random Numbers -----
-            draw_numbers(warped, size)
-
-            # ----- Warp Back to Camera View (AR) -----
-            inv_matrix = cv2.getPerspectiveTransform(dst, pts)
-            overlay = cv2.warpPerspective(warped, inv_matrix,
-                                          (frame.shape[1], frame.shape[0]))
-
-            mask = np.zeros_like(gray)
-            cv2.fillConvexPoly(mask, pts.astype(int), 255)
-            mask_inv = cv2.bitwise_not(mask)
-
-            frame_bg = cv2.bitwise_and(frame, frame, mask=mask_inv)
-            overlay_fg = cv2.bitwise_and(overlay, overlay, mask=mask)
-
-            frame = cv2.add(frame_bg, overlay_fg)
+            # ---- Print matrix ----
+            print("\nDetected Sudoku Matrix:")
+            for row in sudoku_matrix:
+                print(row)
 
             cv2.drawContours(frame, [sudoku_cnt], -1, (0, 255, 0), 3)
 
-    cv2.imshow("AR Sudoku Overlay", frame)
+            cv2.imshow("Warped Sudoku", warped)
+
+    cv2.imshow("Live Camera", frame)
 
     if cv2.waitKey(1) & 0xFF == 27:
         break

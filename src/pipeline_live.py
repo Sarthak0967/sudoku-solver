@@ -1,12 +1,40 @@
+import os
+from datetime import datetime
+
 import cv2
 import torch
-from pathlib import Path
 
-from .model.model import ConvNet
+from .model.model import ConvNet, ResNet18
 from .model.solver import Sudoku as solve_sudoku_algorithm
 from .preprocess.build_features import process_sudoku_image
+from .model.ar_grid_test import warped_image_saving
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def overlay_digits(base_image, grid_digits, cell_coords, color=(0, 0, 0)):
+    output_image = base_image.copy()
+    for i in range(9):
+        for j in range(9):
+            if grid_digits[i][j] != 0:
+                x, y, w, h = cell_coords[i * 9 + j]
+                text_size = cv2.getTextSize(
+                    str(grid_digits[i][j]), cv2.FONT_HERSHEY_SIMPLEX, 1, 2
+                )[0]
+                text_position = (
+                    x + w // 2 - text_size[0] // 2,
+                    y + h // 2 + text_size[1] // 2,
+                )
+                cv2.putText(
+                    output_image,
+                    str(grid_digits[i][j]),
+                    text_position,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    color,
+                    2,
+                )
+    return output_image
 
 
 def predict_grid(model, cell_images):
@@ -16,76 +44,97 @@ def predict_grid(model, cell_images):
     with torch.no_grad():
         for i in range(9):
             for j in range(9):
-                img = cell_images[i * 9 + j]
-                tensor = torch.from_numpy(img).float().unsqueeze(0).unsqueeze(0)
-                tensor = tensor.repeat(1, 3, 1, 1).to(device)
+                cell_image = cell_images[i * 9 + j]
+                tensor_image = (
+                    torch.from_numpy(cell_image)
+                    .float()
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .to(device)
+                )
+                tensor_image = tensor_image.repeat(1, 3, 1, 1)
 
-                output = model(tensor)
-                grid[i][j] = torch.argmax(output, dim=1).item()
+                output = model(tensor_image)
+                grid[i][j] = torch.max(output.data, 1)[1].item()
 
     return grid
 
 
-def overlay_digits(image, grid, cell_coords, color=(0, 255, 0)):
-    for i in range(9):
-        for j in range(9):
-            if grid[i][j] != 0:
-                x, y, w, h = cell_coords[i * 9 + j]
-                cv2.putText(
-                    image,
-                    str(grid[i][j]),
-                    (x + w // 3, y + 2 * h // 3),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    color,
-                    2,
-                )
-    return image
+def save_results(
+    original_image, warped_sudoku, solved_image, output_dir="results/pipeline_outputs"
+):
+    """Save pipeline results with timestamp."""
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Save images
+    cv2.imwrite(f"{output_dir}/{timestamp}_original.jpg", original_image)
+    cv2.imwrite(f"{output_dir}/{timestamp}_extracted_sudoku.jpg", warped_sudoku)
+    cv2.imwrite(f"{output_dir}/{timestamp}_solved.jpg", solved_image)
+
+    print(f"Results saved to {output_dir}/ with timestamp {timestamp}")
+    return timestamp
 
 
-def main():
-    model_path = Path("models/50epochs_convnet_sudoku_only.pkl")
+def main_pipeline(image_path, model_path, save_images=True, show_images=True):
+    # Load and process image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not load image: {image_path}")
 
+    cells, coords, warped = process_sudoku_image(image)
+    if cells is None or coords is None or warped is None:
+        raise ValueError("Failed to process Sudoku image")
+
+    # Load model and predict
     model = ConvNet().to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
 
-    cap = cv2.VideoCapture(0)
+    # Predict and solve
+    grid = predict_grid(model, cells)
+    grid_solution = [row[:] for row in grid]
 
-    solved_grid = None
-    cell_coords = None
+    if solve_sudoku_algorithm(grid_solution, 0, 0):
+        solved_image = overlay_digits(warped, grid_solution, coords)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        # Save results if requested
+        if save_images:
+            timestamp = save_results(image, warped, solved_image)
+            print(
+                f"Pipeline completed successfully. Results saved with timestamp: {timestamp}"
+            )
 
-        display = frame.copy()
+        # Show images if requested
+        if show_images:
+            cv2.imshow("Original", image)
+            cv2.imshow("Extracted Sudoku", warped)
+            cv2.imshow("Solution", solved_image)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
 
-        # --- Solve only once ---
-        if solved_grid is None:
-            cells, coords, warped = process_sudoku_image(frame)
+        return grid_solution
+    else:
+        print("Failed to solve the Sudoku puzzle")
+        return None
 
-            if cells is not None:
-                grid = predict_grid(model, cells)
-                solution = [row[:] for row in grid]
+def get_latest_image(folder="results"):
+    images = [
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if f.endswith(".jpg")
+    ]
+    print(f"Found images: {images}")
+    return max(images, key=os.path.getctime) if images else None
 
-                if solve_sudoku_algorithm(solution, 0, 0):
-                    solved_grid = solution
-                    cell_coords = coords
-                    print("Sudoku solved and locked")
 
-        # --- Overlay every frame ---
-        if solved_grid is not None and cell_coords is not None:
-            display = overlay_digits(display, solved_grid, cell_coords)
-
-        cv2.imshow("Live AR Sudoku Solver", display)
-
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
+from pathlib import Path
 
 if __name__ == "__main__":
-    main()
+    # Project root = sudoku-solver/
+    workspace_root = Path(__file__).resolve().parent.parent
+    warped_image_saving()
+
+    image_path = get_latest_image("results")
+    model_path = workspace_root / "models" / "50epochs_convnet_sudoku_only.pkl"
+
+    main_pipeline(str(image_path), str(model_path))
